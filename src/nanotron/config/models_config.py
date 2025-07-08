@@ -109,6 +109,30 @@ class LlamaConfig:
     def is_using_mup(self) -> bool:
         return self._is_using_mup
 
+@dataclass
+class LlamaMTPConfig(LlamaConfig):
+    """Configuration for a LLAMA MTP model
+
+    Be careful on having a coherent typing as we use it to reconstruct the model from yaml
+    """
+
+    is_llama_config: bool = False  # This is used to differentiate LlamaMTPConfig from LlamaConfig
+    is_llama_mtp_config: bool = True  # We use this help differentiate models in yaml/python conversion
+
+    # MTP configuration
+    num_mtp_layers: int = 1  # Number of MTP layers to add
+    mtp_loss_weight: float = 0.3  # Weight of the MTP
+    use_moe_mtp = False
+    recompute_num_mtp_layers = True
+
+    def __post_init__(self):
+        super().__post_init__()  # ❌ 缺少这行
+        
+        if self.num_mtp_layers < 0:
+            raise ValueError(f"num_mtp_layers must be non-negative, got {self.num_mtp_layers}")
+        if self.mtp_loss_weight < 0:
+            raise ValueError(f"mtp_loss_weight must be non-negative, got {self.mtp_loss_weight}")
+
 
 @dataclass
 class Qwen2Config:
@@ -276,4 +300,4 @@ class Starcoder2Config:
         return self.intermediate_size
 
 
-NanotronConfigs = Union[LlamaConfig, Starcoder2Config, Qwen2Config, Any]
+NanotronConfigs = Union[LlamaConfig, LlamaMTPConfig, Starcoder2Config, Qwen2Config, Any]

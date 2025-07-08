@@ -26,7 +26,7 @@ from torch.utils.checkpoint import CheckpointFunction
 
 from nanotron import distributed as dist
 from nanotron import logging
-from nanotron.config import Config, LlamaConfig, ParallelismArgs
+from nanotron.config import Config, LlamaConfig, LlamaMTPConfig, ParallelismArgs
 from nanotron.config.models_config import RandomInit, SpectralMupInit
 from nanotron.generation.generate_store import AttachableStore
 from nanotron.logging import log_rank
@@ -1222,3 +1222,161 @@ def get_flops(
     hardware_flops = model_flops  # TODO: This is a placeholder for now
 
     return model_flops, hardware_flops
+
+class LlamaModelMTP(LlamaModel):
+    def __init__(
+        self,
+        config: LlamaMTPConfig,
+        parallel_context: ParallelContext,
+        parallel_config: Optional[ParallelismArgs],
+    ):
+        super().__init__(config, parallel_context, parallel_config)
+        
+        # MTP相关配置
+        self.num_mtp_layers = getattr(config, 'num_mtp_layers', None)
+        
+        # 如果启用了MTP，添加MTP层
+        if self.num_mtp_layers is not None and self.num_mtp_layers > 0:
+            self._build_mtp_layers()
+
+    def _build_mtp_layers(self):
+        from nanotron.models.mtp_modules import MTPLayer
+        
+        self.mtp_layers = nn.ModuleList([
+            PipelineBlock(
+                p2p=self.p2p,
+                module_builder=MTPLayer,
+                module_kwargs={
+                    "config": self.config,
+                    "token_embedding": self.token_position_embeddings.pp_block.token_embedding,
+                    "layer_idx": self.config.num_hidden_layers + i + 1,
+                    "mtp_layer_id": i + 1,
+                    "parallel_config": self.parallel_config,
+                    "tp_pg": self.parallel_context.tp_pg,
+                },
+                module_input_keys={"prev_hidden_states", "input_embed", "sequence_mask"},
+                module_output_keys={"hidden_states"},
+            )
+            for i in range(self.num_mtp_layers)
+        ])
+
+    def forward_with_mtp(
+        self,
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
+    ):
+        
+        output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
+        input_embeds = output["input_embeds"]
+        
+        hidden_encoder_states = {
+            "hidden_states": input_embeds,
+            "sequence_mask": input_mask,
+        }
+        
+        for i, encoder_block in enumerate(self.decoder):
+            hidden_encoder_states = encoder_block(**hidden_encoder_states)
+        
+        main_hidden_states = self.final_layer_norm(
+            input=hidden_encoder_states["hidden_states"]
+        )["hidden_states"]
+        
+        main_logits = self.lm_head(x=main_hidden_states)["logits"]
+        
+        mtp_outputs = []
+        if self.num_mtp_layers is not None and self.num_mtp_layers > 0:
+            prev_hidden_states = hidden_encoder_states["hidden_states"]
+            
+            for mtp_layer in self.mtp_layers:
+                mtp_output = mtp_layer(
+                    prev_hidden_states=prev_hidden_states,
+                    input_embed=input_embeds,
+                    sequence_mask=input_mask,
+                )
+                mtp_hidden_states = mtp_output["hidden_states"]
+                
+                # MTP预测
+                mtp_logits = self.lm_head(x=mtp_hidden_states)["logits"]
+                mtp_outputs.append(mtp_logits)
+                
+                # 更新prev_hidden_states用于下一个MTP层
+                prev_hidden_states = mtp_hidden_states
+        
+        return {
+            "main_logits": main_logits,
+            "mtp_outputs": mtp_outputs
+        }
+
+
+class LlamaForTrainingMTP(LlamaForTraining):
+    def __init__(
+        self,
+        config: LlamaMTPConfig,
+        parallel_context: ParallelContext,
+        parallel_config: Optional[ParallelismArgs],
+        random_states: Optional[RandomStates] = None,
+    ):
+        super(NanotronModel, self).__init__()
+        self.model = LlamaModelMTP(
+            config=config, 
+            parallel_context=parallel_context, 
+            parallel_config=parallel_config
+        )
+        
+        loss_kwargs = {"tp_pg": parallel_context.tp_pg}
+        if config.z_loss_enabled:
+            loss_kwargs["z_loss_coefficient"] = config.z_loss_coefficient
+
+        self.loss = PipelineBlock(
+            p2p=self.model.p2p,
+            module_builder=LossWithZLoss if config.z_loss_enabled else Loss,
+            module_kwargs=loss_kwargs,
+            module_input_keys={"sharded_logits", "label_ids", "label_mask"},
+            module_output_keys={"loss", "z_loss"} if config.z_loss_enabled else {"loss"},
+        )
+        
+        self.parallel_context = parallel_context
+        self.config = config
+        self.parallel_config = parallel_config
+
+    def forward(
+        self,
+        input_ids: Union[torch.Tensor, TensorPointer],
+        input_mask: Union[torch.Tensor, TensorPointer],
+        label_ids: Union[torch.Tensor, TensorPointer],
+        label_mask: Union[torch.Tensor, TensorPointer],
+    ):
+        outputs = self.model.forward_with_mtp(input_ids=input_ids, input_mask=input_mask)
+        
+        main_logits = outputs["main_logits"]
+        mtp_outputs = outputs["mtp_outputs"]
+        
+        main_loss = self.loss(
+            sharded_logits=main_logits,
+            label_ids=label_ids,
+            label_mask=label_mask,
+        )
+        loss = main_loss["loss"]
+        mtp_losses = []
+        for idx, mtp_logits in enumerate(mtp_outputs):
+            shifted_labels = label_ids[:, idx+1:]
+            shifted_mask = label_mask[:, idx+1:]
+            
+            mtp_loss = self.loss(
+                sharded_logits=mtp_logits,
+                label_ids=shifted_labels,
+                label_mask=shifted_mask,
+            )
+            loss += self.config.mtp_loss_weight * mtp_loss["loss"] / self.config.num_mtp_layers
+            mtp_losses.append(mtp_loss["loss"])
+
+        result = {
+            "loss": loss,
+            "ntp_loss": main_loss["loss"],
+            "mtp_losses": mtp_losses,
+        }
+        
+        if self.config.z_loss_enabled:
+            result["z_loss"] = main_loss["z_loss"]
+            
+        return result

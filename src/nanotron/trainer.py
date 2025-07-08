@@ -63,7 +63,7 @@ from nanotron.logging.timers import nanotron_timer
 from nanotron.metrics_logging import MetricsLogger
 from nanotron.models import NanotronModel, build_model
 from nanotron.models.base import check_model_has_grad
-from nanotron.models.llama import LlamaForTraining, RotaryEmbedding
+from nanotron.models.llama import LlamaForTraining, RotaryEmbedding, LlamaForTrainingMTP
 from nanotron.models.qwen import Qwen2ForTraining
 from nanotron.models.starcoder2 import Starcoder2ForTraining
 from nanotron.optim.clip_grads import clip_grad_norm
@@ -111,6 +111,7 @@ dist_logger.setLevel(logging.WARNING)
 
 CONFIG_TO_MODEL_CLASS = {
     "LlamaConfig": LlamaForTraining,
+    "LlamaMTPConfig": LlamaForTrainingMTP,
     "Starcoder2Config": Starcoder2ForTraining,
     "Qwen2Config": Qwen2ForTraining,
 }
@@ -568,7 +569,7 @@ class DistributedTrainer:
                 self._update_dataloader_based_on_training_stages(dataloader_or_dls)
 
                 # Training step
-                outputs, loss_avg, z_loss_avg = self.training_step(dataloader=self.current_dataloader)
+                outputs, loss_avg, ntp_loss_avg, mtp_losses_avg, z_loss_avg = self.training_step(dataloader=self.current_dataloader)
 
                 # Update consumption tracking for current batch
                 if hasattr(self.current_base_dl, "dataset"):
@@ -597,7 +598,7 @@ class DistributedTrainer:
                 ].consumed_train_samples += self.global_batch_size
 
                 if (self.iteration_step - 1) % self.config.logging.iteration_step_info_interval == 0:
-                    self.train_step_logs(outputs=outputs, loss_avg=loss_avg, z_loss_avg=z_loss_avg)
+                    self.train_step_logs(outputs=outputs, loss_avg=loss_avg, ntp_loss_avg=ntp_loss_avg, mtp_losses_avg=mtp_losses_avg, z_loss_avg=z_loss_avg)
 
                 # Checkpoint
                 if self.iteration_step % self.config.checkpoints.checkpoint_interval == 0:
@@ -687,21 +688,48 @@ class DistributedTrainer:
 
         # Compute DP average loss and overlap with optimizer step
         if isinstance(outputs[0]["loss"], torch.Tensor):
+            losses_to_sync = []
             # This is an average on only one data rank.
             loss_avg = torch.stack(
                 [output["loss"] for output in outputs]
             ).sum()  # already divided by n_micro_batches_per_batch
+            losses_to_sync.append(loss_avg)
+
             if "z_loss" in outputs[0]:
                 z_loss_avg = torch.stack(
                     [output["z_loss"] for output in outputs]
                 ).sum()  # already divided by n_micro_batches_per_batch
             else:
                 z_loss_avg = None
+            if "ntp_loss" in outputs[0]:
+                ntp_loss_avg = torch.stack(
+                    [output["ntp_loss"] for output in outputs]
+                ).sum()
+                losses_to_sync.append(ntp_loss_avg)
+            else:
+                ntp_loss_avg = None
+            if "mtp_losses" in outputs[0]:
+                mtp_losses_avg = [
+                    torch.stack([output["mtp_losses"][mtp_id] for output in outputs]).sum()
+                    for mtp_id in range(self.model_config.num_mtp_layers)
+                ]
+                losses_to_sync.extend(mtp_losses_avg)
+            else:
+                mtp_losses_avg = None
             # sync loss across DP (we should do the same for z_loss but it's only for logging so let's not sync it rn)
-            handle = dist.all_reduce(loss_avg, group=self.parallel_context.dp_pg, async_op=True, op=dist.ReduceOp.AVG)
+            if len(losses_to_sync) > 0:
+                handles = []
+                for loss_to_sync in losses_to_sync:
+                    # We use async_op=True to overlap with optimizer step
+                    handle = dist.all_reduce(
+                        loss_to_sync, group=self.parallel_context.dp_pg, async_op=True, op=dist.ReduceOp.AVG
+                    )
+                    handles.append(handle)
         else:
             z_loss_avg = None
             loss_avg = None
+            ntp_loss_avg = None
+            mtp_losses_avg = None
             handle = None
 
         # Move optimizer states back to GPU before optimizer step
@@ -727,12 +755,13 @@ class DistributedTrainer:
 
         after_optim_step_sanity_checks(self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator)
 
-        if handle is not None:
-            handle.wait()
+        if handles is not None:
+            for handle in handles:
+                handle.wait()
 
         self.post_train_step()
 
-        return outputs, loss_avg, z_loss_avg
+        return outputs, loss_avg, ntp_loss_avg, mtp_losses_avg, z_loss_avg
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
         outputs = self.pipeline_engine.validate_batch_iter(
@@ -746,6 +775,8 @@ class DistributedTrainer:
         self,
         outputs: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
         loss_avg: Optional[torch.Tensor],
+        ntp_loss_avg: Optional[torch.Tensor],
+        mtp_losses_avg: Optional[List[torch.Tensor]],
         z_loss_avg: Optional[torch.Tensor],
     ) -> None:
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
@@ -792,6 +823,7 @@ class DistributedTrainer:
             LogItem("eta", str(datetime.timedelta(seconds=eta_seconds))),
         ]
 
+        
         def get_cpu_logitems():
             # Add CPU memory usage metrics
             memory = psutil.virtual_memory()
@@ -854,6 +886,13 @@ class DistributedTrainer:
 
         if z_loss_avg is not None:
             basic_log_entries.insert(6, LogItem("z_loss", z_loss_avg.item(), "human_format"))  # , "1.6E"),
+
+        if ntp_loss_avg is not None:
+            basic_log_entries.insert(7, LogItem("ntp_loss", ntp_loss_avg.item(), "human_format"))
+        
+        if mtp_losses_avg is not None:
+            for mtp_id, mtp_loss in enumerate(mtp_losses_avg):
+                basic_log_entries.append(LogItem(f"mtp_loss_{mtp_id}", mtp_loss.item(), "human_format"))
 
         if self.config.optimizer.clip_grad is not None:
             basic_log_entries.insert(
